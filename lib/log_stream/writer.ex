@@ -27,15 +27,15 @@ defmodule LogStream.Writer do
       end
 
     block_id = System.unique_integer([:positive, :monotonic])
-    timestamps = Enum.map(entries, & &1.timestamp)
+    {ts_min, ts_max, count} = ts_min_max_count(entries)
 
     meta = %{
       block_id: block_id,
       file_path: nil,
       byte_size: byte_size(data),
-      entry_count: length(entries),
-      ts_min: Enum.min(timestamps),
-      ts_max: Enum.max(timestamps),
+      entry_count: count,
+      ts_min: ts_min,
+      ts_max: ts_max,
       data: data,
       format: format
     }
@@ -58,15 +58,15 @@ defmodule LogStream.Writer do
 
     case File.write(file_path, data) do
       :ok ->
-        timestamps = Enum.map(entries, & &1.timestamp)
+        {ts_min, ts_max, count} = ts_min_max_count(entries)
 
         meta = %{
           block_id: block_id,
           file_path: file_path,
           byte_size: byte_size(data),
-          entry_count: length(entries),
-          ts_min: Enum.min(timestamps),
-          ts_max: Enum.max(timestamps),
+          entry_count: count,
+          ts_min: ts_min,
+          ts_max: ts_max,
           format: format
         }
 
@@ -75,6 +75,16 @@ defmodule LogStream.Writer do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Single pass: extract min timestamp, max timestamp, and count
+  defp ts_min_max_count([first | rest]) do
+    ts = first.timestamp
+
+    Enum.reduce(rest, {ts, ts, 1}, fn entry, {mn, mx, c} ->
+      t = entry.timestamp
+      {min(t, mn), max(t, mx), c + 1}
+    end)
   end
 
   @spec decompress_block(binary(), :raw | :zstd) :: {:ok, [map()]} | {:error, :corrupt_block}

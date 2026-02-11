@@ -16,6 +16,11 @@ defmodule LogStream.Index do
     GenServer.call(__MODULE__, {:index_block, block_meta, entries})
   end
 
+  @spec index_block_async(LogStream.Writer.block_meta(), [map()]) :: :ok
+  def index_block_async(block_meta, entries) do
+    GenServer.cast(__MODULE__, {:index_block, block_meta, entries})
+  end
+
   @spec query(keyword()) :: {:ok, LogStream.Result.t()}
   def query(filters) do
     # Phase 1: GenServer does the cheap SQLite lookup only
@@ -70,6 +75,9 @@ defmodule LogStream.Index do
     GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, new_meta, new_entries}, 60_000)
   end
 
+  # Flush pending index operations after this interval
+  @index_flush_interval 100
+
   @impl true
   def init(opts) do
     storage = Keyword.get(opts, :storage, :disk)
@@ -88,22 +96,27 @@ defmodule LogStream.Index do
       end
 
     create_tables(db)
-    {:ok, %{db: db, db_path: db_path, storage: storage}}
+
+    {:ok,
+     %{db: db, db_path: db_path, storage: storage, pending: [], flush_timer: nil}}
   end
 
   @impl true
-  def terminate(_reason, %{db: db}) do
-    Exqlite.Sqlite3.close(db)
+  def terminate(_reason, state) do
+    flush_pending(state)
+    Exqlite.Sqlite3.close(state.db)
   end
 
   @impl true
   def handle_call({:index_block, meta, entries}, _from, state) do
+    # Sync call: flush any pending ops first, then index this block immediately
+    state = flush_pending(state)
     result = do_index_block(state.db, meta, entries)
     {:reply, result, state}
   end
 
-  @impl true
   def handle_call({:query_plan, filters}, _from, state) do
+    state = flush_pending(state)
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
     order = Keyword.get(pagination, :order, :desc)
@@ -113,18 +126,21 @@ defmodule LogStream.Index do
 
   @impl true
   def handle_call({:delete_before, cutoff}, _from, state) do
+    state = flush_pending(state)
     count = do_delete_before(state.db, cutoff, state.storage)
     {:reply, count, state}
   end
 
   @impl true
   def handle_call({:delete_over_size, max_bytes}, _from, state) do
+    state = flush_pending(state)
     count = do_delete_over_size(state.db, max_bytes, state.storage)
     {:reply, count, state}
   end
 
   @impl true
   def handle_call({:matching_block_ids, filters}, _from, state) do
+    state = flush_pending(state)
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
     order = Keyword.get(pagination, :order, :asc)
@@ -134,32 +150,50 @@ defmodule LogStream.Index do
 
   @impl true
   def handle_call(:stats, _from, state) do
+    state = flush_pending(state)
     result = do_stats(state.db, state.db_path)
     {:reply, result, state}
   end
 
   @impl true
   def handle_call({:read_block_data, block_id}, _from, state) do
+    state = flush_pending(state)
     result = read_block_from_db(state.db, block_id)
     {:reply, result, state}
   end
 
   @impl true
   def handle_call(:raw_block_stats, _from, state) do
+    state = flush_pending(state)
     result = do_raw_block_stats(state.db)
     {:reply, result, state}
   end
 
   @impl true
   def handle_call(:raw_block_ids, _from, state) do
+    state = flush_pending(state)
     result = do_raw_block_ids(state.db)
     {:reply, result, state}
   end
 
-  @impl true
   def handle_call({:compact_blocks, old_ids, new_meta, new_entries}, _from, state) do
+    state = flush_pending(state)
     result = do_compact_blocks(state.db, old_ids, new_meta, new_entries, state.storage)
     {:reply, result, state}
+  end
+
+  @impl true
+  def handle_cast({:index_block, meta, entries}, state) do
+    pending = [{meta, entries} | state.pending]
+    state = schedule_index_flush(%{state | pending: pending})
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:flush_index, state) do
+    state = %{state | flush_timer: nil}
+    state = flush_pending(state)
+    {:noreply, state}
   end
 
   defp do_stats(db, db_path) do
@@ -286,11 +320,42 @@ defmodule LogStream.Index do
     end
   end
 
+  defp flush_pending(%{pending: []} = state), do: state
+
+  defp flush_pending(%{pending: pending, db: db} = state) do
+    Exqlite.Sqlite3.execute(db, "BEGIN")
+
+    for {meta, entries} <- Enum.reverse(pending) do
+      index_block_inner(db, meta, entries)
+    end
+
+    Exqlite.Sqlite3.execute(db, "COMMIT")
+
+    if state.flush_timer do
+      Process.cancel_timer(state.flush_timer)
+    end
+
+    %{state | pending: [], flush_timer: nil}
+  end
+
+  defp schedule_index_flush(%{flush_timer: nil} = state) do
+    ref = Process.send_after(self(), :flush_index, @index_flush_interval)
+    %{state | flush_timer: ref}
+  end
+
+  defp schedule_index_flush(state), do: state
+
   defp do_index_block(db, meta, entries) do
+    Exqlite.Sqlite3.execute(db, "BEGIN")
+    index_block_inner(db, meta, entries)
+    Exqlite.Sqlite3.execute(db, "COMMIT")
+    :ok
+  end
+
+  # Index a single block's metadata + terms (caller manages transaction)
+  defp index_block_inner(db, meta, entries) do
     format = Map.get(meta, :format, :zstd)
     format_str = Atom.to_string(format)
-
-    Exqlite.Sqlite3.execute(db, "BEGIN")
 
     {:ok, block_stmt} =
       Exqlite.Sqlite3.prepare(db, """
@@ -313,21 +378,32 @@ defmodule LogStream.Index do
     Exqlite.Sqlite3.release(db, block_stmt)
 
     terms = extract_terms(entries)
+    insert_terms_batch(db, terms, meta.block_id)
+  end
 
-    {:ok, term_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT OR IGNORE INTO block_terms (term, block_id) VALUES (?1, ?2)
-      """)
+  # Batch INSERT up to 400 terms per statement (800 params, well under SQLite's 999 limit)
+  @terms_batch_size 400
 
-    for term <- terms do
-      Exqlite.Sqlite3.bind(term_stmt, [term, meta.block_id])
-      Exqlite.Sqlite3.step(db, term_stmt)
-      Exqlite.Sqlite3.reset(term_stmt)
-    end
+  defp insert_terms_batch(_db, [], _block_id), do: :ok
 
-    Exqlite.Sqlite3.release(db, term_stmt)
-    Exqlite.Sqlite3.execute(db, "COMMIT")
-    :ok
+  defp insert_terms_batch(db, terms, block_id) do
+    terms
+    |> Enum.chunk_every(@terms_batch_size)
+    |> Enum.each(fn batch ->
+      n = length(batch)
+
+      placeholders =
+        Enum.map_join(1..n, ", ", fn i ->
+          "(?#{i * 2 - 1}, ?#{i * 2})"
+        end)
+
+      sql = "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+      params = Enum.flat_map(batch, fn term -> [term, block_id] end)
+      Exqlite.Sqlite3.bind(stmt, params)
+      Exqlite.Sqlite3.step(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+    end)
   end
 
   defp extract_terms(entries) do
@@ -546,19 +622,8 @@ defmodule LogStream.Index do
 
     # Insert terms for new block
     terms = extract_terms(new_entries)
+    insert_terms_batch(db, terms, new_meta.block_id)
 
-    {:ok, term_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT OR IGNORE INTO block_terms (term, block_id) VALUES (?1, ?2)
-      """)
-
-    for term <- terms do
-      Exqlite.Sqlite3.bind(term_stmt, [term, new_meta.block_id])
-      Exqlite.Sqlite3.step(db, term_stmt)
-      Exqlite.Sqlite3.reset(term_stmt)
-    end
-
-    Exqlite.Sqlite3.release(db, term_stmt)
     Exqlite.Sqlite3.execute(db, "COMMIT")
 
     # Clean up old files after successful commit

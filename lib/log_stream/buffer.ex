@@ -32,7 +32,7 @@ defmodule LogStream.Buffer do
   @impl true
   def terminate(_reason, state) do
     :logger.remove_handler(LogStream.Handler.handler_id())
-    do_flush(state.buffer, state.data_dir)
+    do_flush(state.buffer, state.data_dir, sync: true)
     :ok
   end
 
@@ -52,7 +52,7 @@ defmodule LogStream.Buffer do
 
   @impl true
   def handle_call(:flush, _from, state) do
-    do_flush(state.buffer, state.data_dir)
+    do_flush(state.buffer, state.data_dir, sync: true)
     {:reply, :ok, %{state | buffer: [], buffer_size: 0}}
   end
 
@@ -66,9 +66,10 @@ defmodule LogStream.Buffer do
     {:noreply, %{state | buffer: [], buffer_size: 0}}
   end
 
-  defp do_flush([], _data_dir), do: :ok
+  defp do_flush(buffer, data_dir, opts \\ [])
+  defp do_flush([], _data_dir, _opts), do: :ok
 
-  defp do_flush(buffer, data_dir) do
+  defp do_flush(buffer, data_dir, opts) do
     entries = Enum.reverse(buffer)
     start_time = System.monotonic_time()
 
@@ -76,7 +77,12 @@ defmodule LogStream.Buffer do
 
     case LogStream.Writer.write_block(entries, write_target, :raw) do
       {:ok, block_meta} ->
-        LogStream.Index.index_block(block_meta, entries)
+        if Keyword.get(opts, :sync, false) do
+          LogStream.Index.index_block(block_meta, entries)
+        else
+          LogStream.Index.index_block_async(block_meta, entries)
+        end
+
         duration = System.monotonic_time() - start_time
 
         LogStream.Telemetry.event(
@@ -99,15 +105,21 @@ defmodule LogStream.Buffer do
   end
 
   defp broadcast_to_subscribers(entry) do
-    entry_struct = LogStream.Entry.from_map(entry)
+    case Registry.count_match(LogStream.Registry, :log_entries, :_) do
+      0 ->
+        :ok
 
-    Registry.dispatch(LogStream.Registry, :log_entries, fn subscribers ->
-      for {pid, opts} <- subscribers do
-        if matches_subscription?(entry, opts) do
-          send(pid, {:log_stream, :entry, entry_struct})
-        end
-      end
-    end)
+      _n ->
+        entry_struct = LogStream.Entry.from_map(entry)
+
+        Registry.dispatch(LogStream.Registry, :log_entries, fn subscribers ->
+          for {pid, opts} <- subscribers do
+            if matches_subscription?(entry, opts) do
+              send(pid, {:log_stream, :entry, entry_struct})
+            end
+          end
+        end)
+    end
   end
 
   defp matches_subscription?(_entry, []), do: true

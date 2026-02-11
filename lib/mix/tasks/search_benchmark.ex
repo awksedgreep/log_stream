@@ -196,19 +196,23 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
       end)
       |> Enum.uniq()
 
-    {:ok, term_stmt} =
-      Exqlite.Sqlite3.prepare(
-        db,
-        "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES (?1, ?2)"
-      )
+    # Batch insert terms (400 per statement, 800 params)
+    terms
+    |> Enum.chunk_every(400)
+    |> Enum.each(fn batch ->
+      n = length(batch)
 
-    for term <- terms do
-      Exqlite.Sqlite3.bind(term_stmt, [term, meta.block_id])
-      Exqlite.Sqlite3.step(db, term_stmt)
-      Exqlite.Sqlite3.reset(term_stmt)
-    end
+      placeholders =
+        Enum.map_join(1..n, ", ", fn i -> "(?#{i * 2 - 1}, ?#{i * 2})" end)
 
-    Exqlite.Sqlite3.release(db, term_stmt)
+      sql = "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+      params = Enum.flat_map(batch, fn term -> [term, meta.block_id] end)
+      Exqlite.Sqlite3.bind(stmt, params)
+      Exqlite.Sqlite3.step(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+    end)
+
     Exqlite.Sqlite3.execute(db, "COMMIT")
   end
 
